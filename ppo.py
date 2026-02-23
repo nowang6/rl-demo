@@ -9,31 +9,39 @@ import numpy as np
 # ====== 超参数 ======
 GAMMA = 0.99           # 折扣因子
 EPS_CLIP = 0.2         # PPO 裁剪范围
-LR = 1e-4              # 学习率
+LR = 3e-4              # 学习率
 UPDATE_EPOCHS = 4      # 每次数据收集后的更新轮数
 MAX_EPISODES = 500     # 最大训练回合数
 HIDDEN_SIZE = 128      # 隐藏层大小
-ENTROPY_COEF = 0.05    # 熵系数
-VALUE_COEF = 0.5       # 价值损失系数
-MAX_GRAD_NORM = 0.5    # 梯度裁剪阈值
+NUM_LAYERS = 3         # 共享层数（加深网络提升表达能力）
 
 
 class ActorCritic(nn.Module):
-    """Actor-Critic 网络，共享特征提取层"""
+    """Actor-Critic 网络：深层共享特征 + 独立 Actor/Critic 头"""
     def __init__(self, state_dim, action_dim):
         super().__init__()
-        # 共享特征提取层 - 简化但保持容量
-        self.shared = nn.Sequential(
-            nn.Linear(state_dim, HIDDEN_SIZE),
-            nn.ReLU(),
-        )
-        # Actor 输出动作概率
+        # 深层共享特征提取
+        shared_layers = []
+        in_dim = state_dim
+        for _ in range(NUM_LAYERS):
+            shared_layers.append(nn.Linear(in_dim, HIDDEN_SIZE))
+            shared_layers.append(nn.ReLU())
+            in_dim = HIDDEN_SIZE
+        self.shared = nn.Sequential(*shared_layers)
+
+        # Actor：额外一层 + 动作概率
         self.actor = nn.Sequential(
+            nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE),
+            nn.ReLU(),
             nn.Linear(HIDDEN_SIZE, action_dim),
-            nn.Softmax(dim=-1)
+            nn.Softmax(dim=-1),
         )
-        # Critic 输出状态价值
-        self.critic = nn.Linear(HIDDEN_SIZE, 1)
+        # Critic：额外一层 + 状态价值
+        self.critic = nn.Sequential(
+            nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE),
+            nn.ReLU(),
+            nn.Linear(HIDDEN_SIZE, 1),
+        )
 
     def forward(self, state):
         features = self.shared(state)
@@ -69,12 +77,11 @@ def compute_returns(rewards, gamma=GAMMA):
     return torch.FloatTensor(returns)
 
 
-def train(max_episodes=MAX_EPISODES):
-    """训练 PPO 智能体
+def train(max_episodes=None):
+    """训练 PPO 智能体"""
+    if max_episodes is None:
+        max_episodes = MAX_EPISODES
 
-    Args:
-        max_episodes: 最大训练回合数
-    """
     # 创建环境
     env = gym.make("CartPole-v1")
     state_dim = env.observation_space.shape[0]
@@ -86,8 +93,7 @@ def train(max_episodes=MAX_EPISODES):
 
     print("开始训练 PPO...")
     print(f"环境: CartPole-v1, 状态维度: {state_dim}, 动作维度: {action_dim}")
-    print(f"超参数: gamma={GAMMA}, lr={LR}, eps_clip={EPS_CLIP}, update_epochs={UPDATE_EPOCHS}, entropy_coef={ENTROPY_COEF}, value_coef={VALUE_COEF}")
-    print(f"训练回合数: {max_episodes}")
+    print(f"超参数: gamma={GAMMA}, lr={LR}, eps_clip={EPS_CLIP}, update_epochs={UPDATE_EPOCHS}, max_episodes={max_episodes}")
 
     for episode in range(max_episodes):
         # 收集一条轨迹的数据
@@ -124,9 +130,6 @@ def train(max_episodes=MAX_EPISODES):
         values_tensor = torch.stack(values)
         advantages = returns - values_tensor.detach()
 
-        # 优势标准化 (降低方差，稳定训练)
-        # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
         # 转换为张量
         states_tensor = torch.stack(states)
         actions_tensor = torch.stack(actions)
@@ -146,18 +149,15 @@ def train(max_episodes=MAX_EPISODES):
 
             # 计算损失
             actor_loss = -torch.min(surr1, surr2).mean()
-            # 价值损失 (MSE)
-            critic_loss = 0.5 * nn.MSELoss()(new_values, returns)
+            critic_loss = nn.MSELoss()(new_values, returns)
             entropy_loss = -entropy.mean()  # 负熵，鼓励探索
 
             # 总损失
-            loss = actor_loss + VALUE_COEF * critic_loss + ENTROPY_COEF * entropy_loss
+            loss = actor_loss + 0.5 * critic_loss + 0.01 * entropy_loss
 
             # 反向传播
             optimizer.zero_grad()
             loss.backward()
-            # 梯度裁剪，防止梯度爆炸
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
             optimizer.step()
 
         # 输出训练进度
