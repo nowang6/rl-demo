@@ -130,6 +130,7 @@ class PPO:
         with torch.no_grad():
             old_action_log_prob = torch.log(self.policy_model(states).gather(1, actions))
             td_target = rewards + (1 - dones) * self.gamma * self.value_model(next_states)
+            #td 是 Temporal Difference（时序差分）的缩写
             td_delta = td_target - self.value_model(states)
 
         advantage = self.calc_advantage(td_delta)
@@ -143,13 +144,13 @@ class PPO:
             # ratio < 1：新策略对该动作赋予更低概率；结合 A<0 时是期望方向，A>0 时则过度更新
             # clip 限制 ratio 在 [1-ε, 1+ε]，避免单次更新步长过大、策略偏离旧数据分布过远
 
-            
-            
             # 未裁剪的重要性采样策略梯度项
             part1 = ratio * advantage
             
             #对 ratio 做 PPO 的 clip 后再乘 advantage
             part2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantage
+            
+            #当 ratio 偏离 1 太多时，part1 会变大或变小得很厉害，而 part2 被 clip 住；取 min 会选更保守的那一项，从而限制更新幅度，这就是 PPO-Clip 的“悲观”更新。
             
             #PPO-Clip 目标（取 min 再取负做最小化）
             policy_loss = -torch.min(part1, part2).mean()
