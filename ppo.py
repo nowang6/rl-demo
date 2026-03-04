@@ -1,4 +1,3 @@
-# 导入必要的库
 import argparse
 import sys
 import os
@@ -9,15 +8,9 @@ import torch.optim as optim
 import torch.nn.functional as F
 from tqdm import tqdm
 import gymnasium as gym
-
-# 仅训练结束后画奖励曲线时使用
-import matplotlib.pyplot as plt
-
-
-# ----- 策略网络与价值网络 -----
 class PolicyModel(nn.Module):
-    """策略模型：给定状态输出各动作概率分布。"""
-
+    # input_dim=6  Acrobot的Observation Space
+    # output_dim=3  Acrobot的Action Space
     def __init__(self, input_dim, output_dim):
         super().__init__()
         self.fc = nn.Sequential(
@@ -28,14 +21,13 @@ class PolicyModel(nn.Module):
             nn.Linear(128, output_dim),
             nn.Softmax(dim=1),
         )
-
+    
+    # 输出为各个动作的概率    
     def forward(self, x):
         return self.fc(x)
 
 
 class ValueModel(nn.Module):
-    """价值模型：给定状态估计价值。"""
-
     def __init__(self, input_dim):
         super().__init__()
         self.fc = nn.Sequential(
@@ -45,12 +37,10 @@ class ValueModel(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 1),
         )
-
+    # 输出为价值估计
     def forward(self, x):
         return self.fc(x)
 
-
-# ----- PPO 算法 -----
 class PPO:
     def __init__(
         self,
@@ -110,9 +100,11 @@ class PPO:
         self.value_model.load_state_dict(data["value"])
 
     def calc_advantage(self, td_delta):
+        # TD 误差
         td_delta = td_delta.cpu().detach().numpy()
         advantage = 0
         advantage_list = []
+        # [::-1] 反向遍历
         for r in td_delta[::-1]:
             advantage = r + self.gamma * self.lamda * advantage
             advantage_list.insert(0, advantage)
@@ -129,8 +121,11 @@ class PPO:
         # 用当前策略算一次 log π_old(a|s) 并固定下来，后面多轮更新时都拿它当“旧策略”
         with torch.no_grad():
             old_action_log_prob = torch.log(self.policy_model(states).gather(1, actions))
+            # 即时奖励 + 未结束时的下一状态价值的折现。
             td_target = rewards + (1 - dones) * self.gamma * self.value_model(next_states)
-            #td 是 Temporal Difference（时序差分）的缩写
+            
+            #td_delta > 0：实际得到的（奖励 + 下一状态价值）比估计高  -> 当前 V(s_t) 偏小
+            #d_delta < 0：比估计低  -> 当前 V(s_t) 偏大
             td_delta = td_target - self.value_model(states)
 
         advantage = self.calc_advantage(td_delta)
@@ -192,10 +187,6 @@ def main(max_episodes=300):
         episode_rewards.append(episode_reward)
         if episode % (max_episodes // 10) == 0:
             tqdm.write(f"Episode {episode}: {episode_reward}")
-
-    plt.plot(episode_rewards)
-    plt.title("reward")
-    plt.show()
 
     # 保存模型，便于之后单独测试
     checkpoint_path = "ppo_acrobot.pt"
