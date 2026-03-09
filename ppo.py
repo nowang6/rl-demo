@@ -8,9 +8,15 @@ import torch.optim as optim
 import torch.nn.functional as F
 from tqdm import tqdm
 import gymnasium as gym
+from torch.distributions import Categorical
+
+
 class PolicyModel(nn.Module):
-    # input_dim=6  Acrobot的Observation Space
-    # output_dim=3  Acrobot的Action Space
+    """
+    策略网络：输入状态，输出动作概率分布
+    input_dim: 状态空间维度（Acrobot为6）
+    output_dim: 动作空间维度（Acrobot为3）
+    """
     def __init__(self, input_dim, output_dim):
         super().__init__()
         self.fc = nn.Sequential(
@@ -22,12 +28,16 @@ class PolicyModel(nn.Module):
             nn.Softmax(dim=1),
         )
     
-    # 输出为各个动作的概率    
     def forward(self, x):
+        """输出为各个动作的概率分布"""
         return self.fc(x)
 
 
 class ValueModel(nn.Module):
+    """
+    价值网络：输入状态，输出状态价值估计
+    input_dim: 状态空间维度
+    """
     def __init__(self, input_dim):
         super().__init__()
         self.fc = nn.Sequential(
@@ -37,11 +47,22 @@ class ValueModel(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 1),
         )
-    # 输出为价值估计
+    
     def forward(self, x):
+        """输出为状态价值估计 V(s)"""
         return self.fc(x)
 
+
 class PPO:
+    """
+    PPO (Proximal Policy Optimization) 算法实现
+    
+    严格按照伪代码实现，包括：
+    - GAE (Generalized Advantage Estimation) 优势估计
+    - 小批量更新
+    - 熵奖励项
+    - KL 散度早停机制
+    """
     def __init__(
         self,
         env,
@@ -50,15 +71,25 @@ class PPO:
         lamda=0.95,
         clip_eps=0.2,
         epochs=10,
+        batch_size=64,
+        target_kl=0.01,
+        entropy_coef=0.01,
     ):
         self.env = env
-        # 折扣因子
+        # 折扣因子 γ
         self.gamma = gamma
-        # 优势函数 在 GAE (Generalized Advantage Estimation) 里控制“用多长的回报估计”来算优势。
+        # GAE 参数 λ，控制优势估计的偏差-方差权衡
         self.lamda = lamda
-        # PPO裁剪范围
+        # PPO 剪切参数 ε
         self.clip_eps = clip_eps
+        # 策略更新次数 K
         self.epochs = epochs
+        # 小批量大小 M
+        self.batch_size = batch_size
+        # 目标 KL 散度 δ
+        self.target_kl = target_kl
+        # 熵系数 c2
+        self.entropy_coef = entropy_coef
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         obs_dim = env.observation_space.shape[0]
@@ -69,17 +100,21 @@ class PPO:
         self.value_optimizer = optim.Adam(self.value_model.parameters(), lr=learning_rate)
 
     def choose_action(self, state, deterministic=False):
-        """选动作。deterministic=True 时取概率最大的动作（用于评估）。"""
+        """
+        选择动作
+        deterministic=True: 取概率最大的动作（用于评估）
+        deterministic=False: 从概率分布中采样（用于训练）
+        """
         state = torch.FloatTensor(np.array([state])).to(self.device)
         with torch.no_grad():
             action_prob = self.policy_model(state)
         
-        # 评价或者演示的时候，取概率最大的动作
         if deterministic:
+            # 评估时：取概率最大的动作
             action = action_prob.argmax(dim=1).item()
-        # 训练的时候，取概率分布中的动作
         else:
-            c = torch.distributions.Categorical(action_prob)
+            # 训练时：从概率分布中采样
+            c = Categorical(action_prob)
             action = c.sample().item()
         return action
 
@@ -99,64 +134,118 @@ class PPO:
         self.policy_model.load_state_dict(data["policy"])
         self.value_model.load_state_dict(data["value"])
 
-    def calc_advantage(self, td_delta):
-        # TD 误差
-        td_delta = td_delta.cpu().detach().numpy()
-        advantage = 0
-        advantage_list = []
-        # [::-1] 反向遍历
-        for r in td_delta[::-1]:
-            advantage = r + self.gamma * self.lamda * advantage
-            advantage_list.insert(0, advantage)
-        return torch.FloatTensor(np.array(advantage_list)).to(self.device)
+    def compute_kl_divergence(self, old_probs, new_probs):
+        """
+        计算 KL 散度：KL[π_θ_old || π_θ] = Σ_a π_θ_old(a|s) log(π_θ_old(a|s) / π_θ(a|s))
+        """
+        old_probs = old_probs + 1e-8  # 避免 log(0)
+        new_probs = new_probs + 1e-8
+        kl = (old_probs * torch.log(old_probs / new_probs)).sum(dim=1).mean()
+        return kl.item()
 
     def update(self, buffer):
+        """
+        按照伪代码严格实现的 PPO 更新方法
+        
+        输入：轨迹集 D_i = {(S_t, A_t, R_t, S_{t+1})}
+        输出：更新后的策略参数 θ 和价值函数参数 W
+        """
+        # 步骤 2: 用策略 π_θ 收集轨迹集 D_i = {(S_t, A_t, R_t, S_{t+1})}
         states, actions, rewards, next_states, dones = zip(*buffer)
+        T = len(states)  # 轨迹长度
+        
+        # 转换为张量
         states = torch.FloatTensor(np.array(states)).to(self.device)
         actions = torch.tensor(np.array(actions), dtype=torch.long).view(-1, 1).to(self.device)
-        rewards = torch.FloatTensor(np.array(rewards)).view(-1, 1).to(self.device)
+        rewards = torch.FloatTensor(np.array(rewards)).to(self.device)
         next_states = torch.FloatTensor(np.array(next_states)).to(self.device)
-        dones = torch.FloatTensor(np.array(dones)).view(-1, 1).to(self.device)
+        dones = torch.FloatTensor(np.array(dones)).to(self.device)
         
-        # 用当前策略算一次 log π_old(a|s) 并固定下来，后面多轮更新时都拿它当“旧策略”
+        # 步骤 3: 使用当前价值网络计算 V_old(S_t) ← V(S_t; W)
         with torch.no_grad():
-            old_action_log_prob = torch.log(self.policy_model(states).gather(1, actions))
-            # 即时奖励 + 未结束时的下一状态价值的折现。
-            td_target = rewards + (1 - dones) * self.gamma * self.value_model(next_states)
+            v_old = self.value_model(states).squeeze()  # [T]
+            v_old_next = self.value_model(next_states).squeeze()  # [T]
+            # 对于终止状态，下一状态价值为 0
+            v_old_next = v_old_next * (1 - dones)
             
-            #td_delta > 0：实际得到的（奖励 + 下一状态价值）比估计高  -> 当前 V(s_t) 偏小
-            #d_delta < 0：比估计低  -> 当前 V(s_t) 偏大
-            td_delta = td_target - self.value_model(states)
-
-        advantage = self.calc_advantage(td_delta)
-
-        for _ in range(self.epochs):
-            # 当前（更新中）策略的 log π(a|s)
-            action_log_prob = torch.log(self.policy_model(states).gather(1, actions))
-            # 计算重要性比率：新策略与旧策略的比值
-            ratio = torch.exp(action_log_prob - old_action_log_prob)
-            # ratio > 1：新策略对该动作赋予更高概率；结合 A>0 时是期望方向，A<0 时则过度更新
-            # ratio < 1：新策略对该动作赋予更低概率；结合 A<0 时是期望方向，A>0 时则过度更新
-            # clip 限制 ratio 在 [1-ε, 1+ε]，避免单次更新步长过大、策略偏离旧数据分布过远
-
-            # 未裁剪的重要性采样策略梯度项
-            part1 = ratio * advantage
+            # 保存旧策略的动作概率，用于计算重要性采样比率和 KL 散度
+            old_action_probs = self.policy_model(states)  # [T, action_dim]
+            old_action_log_probs = torch.log(old_action_probs.gather(1, actions)).squeeze()  # [T]
+        
+        # 步骤 4: 初始化优势估计 A_t = 0
+        # 步骤 5-8: 从后向前处理每个时间步，计算 GAE 优势估计
+        advantages = torch.zeros(T, device=self.device)
+        advantage = 0.0
+        
+        # 从后向前遍历：t = T-1, T-2, ..., 0
+        for t in range(T - 1, -1, -1):
+            # 步骤 6: 计算 TD 误差 δ_t = R_t + γ*V_old(S_{t+1}) - V_old(S_t)
+            # 注意：对于终止状态（done=True），v_old_next[t] 已经被置为 0
+            delta_t = rewards[t] + self.gamma * v_old_next[t] - v_old[t]
             
-            #对 ratio 做 PPO 的 clip 后再乘 advantage
-            part2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantage
+            # 步骤 7: 更新优势估计 A_t = δ_t + γ*λ*A_{t+1}
+            advantage = delta_t + self.gamma * self.lamda * advantage
+            advantages[t] = advantage
+        
+        # 步骤 9: θ_old ← θ（已通过 old_action_probs 保存）
+        
+        # 步骤 10: for 更新步 k = 1 to K do
+        for k in range(self.epochs):
+            # 步骤 11: 将 D_i 随机划分为小批量 {D'_1, D'_2, ...}
+            indices = torch.randperm(T, device=self.device)
             
-            #当 ratio 偏离 1 太多时，part1 会变大或变小得很厉害，而 part2 被 clip 住；取 min 会选更保守的那一项，从而限制更新幅度，这就是 PPO-Clip 的“悲观”更新。
+            for start_idx in range(0, T, self.batch_size):
+                end_idx = min(start_idx + self.batch_size, T)
+                batch_indices = indices[start_idx:end_idx]
+                
+                batch_states = states[batch_indices]
+                batch_actions = actions[batch_indices]
+                batch_advantages = advantages[batch_indices].unsqueeze(1)  # [batch_size, 1]
+                batch_v_old = v_old[batch_indices].unsqueeze(1)  # [batch_size, 1]
+                batch_old_action_log_probs = old_action_log_probs[batch_indices].unsqueeze(1)  # [batch_size, 1]
+                batch_old_action_probs = old_action_probs[batch_indices]  # [batch_size, action_dim]
+                
+                # 步骤 13: 计算重要性采样比率 r_t(θ) = π_θ(A_t|S_t) / π_θ_old(A_t|S_t)
+                current_action_probs = self.policy_model(batch_states)  # [batch_size, action_dim]
+                current_action_log_probs = torch.log(current_action_probs.gather(1, batch_actions))  # [batch_size, 1]
+                ratio = torch.exp(current_action_log_probs - batch_old_action_log_probs)  # [batch_size, 1]
+                
+                # 步骤 14: 计算剪切目标 L_t^CLIP = min(r_t(θ)*A_t, clip(r_t(θ), 1-ε, 1+ε)*A_t)
+                part1 = ratio * batch_advantages
+                clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
+                part2 = clipped_ratio * batch_advantages
+                clip_loss = -torch.min(part1, part2).mean()  # 取负号因为要最大化
+                
+                # 步骤 15: 计算目标回报 R_t ← A_t + V_old(s_t)
+                target_returns = batch_advantages + batch_v_old  # [batch_size, 1]
+                
+                # 步骤 16: 计算价值损失 L_t^VF = (V(S_t; W) - R_t)^2
+                current_values = self.value_model(batch_states)  # [batch_size, 1]
+                value_loss = F.mse_loss(current_values, target_returns)
+                
+                # 步骤 17: 计算熵奖励 S_t = -Σ_a π_θ(a|S_t) log π_θ(a|S_t)
+                dist = Categorical(current_action_probs)
+                entropy = dist.entropy().mean()  # 熵（越大越好，鼓励探索）
+                
+                # 步骤 18: 更新策略 θ ← θ + β_θ * ∇_θ E[L_t^CLIP + c2*S_t]
+                policy_loss = clip_loss - self.entropy_coef * entropy
+                
+                self.policy_optimizer.zero_grad()
+                policy_loss.backward()
+                self.policy_optimizer.step()
+                
+                # 步骤 19: 更新价值函数 W ← W - β_W * ∇_W E[L_t^VF]
+                self.value_optimizer.zero_grad()
+                value_loss.backward()
+                self.value_optimizer.step()
             
-            #PPO-Clip 目标（取 min 再取负做最小化）
-            policy_loss = -torch.min(part1, part2).mean()
-            value_loss = F.mse_loss(self.value_model(states), td_target).mean()
-
-            self.policy_optimizer.zero_grad()
-            self.value_optimizer.zero_grad()
-            policy_loss.backward()
-            value_loss.backward()
-            self.policy_optimizer.step()
-            self.value_optimizer.step()
+            # 步骤 21-23: 检查 KL 散度，如果 KL[π_θ_old || π_θ] > 1.5δ，则 break
+            with torch.no_grad():
+                current_probs = self.policy_model(states)
+                kl_div = self.compute_kl_divergence(old_action_probs, current_probs)
+                if kl_div > 1.5 * self.target_kl:
+                    # 步骤 22: break（提前停止更新）
+                    break
 
 
 # ----- 训练与可视化 -----
